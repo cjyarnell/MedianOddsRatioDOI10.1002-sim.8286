@@ -1,0 +1,751 @@
+---
+title: 'Extending Median Odds Ratio: Technical R-Code Appendix'
+documentclass: article
+thanks: Corresponding author
+author:
+- Christopher Yarnell
+- Ruxandra Pinto
+- Rob Fowler
+institute: University of Toronto
+date: "`r Sys.Date()`"
+linestretch: 1.5
+fontsize: 11pt
+geometry: margin = 2.5cm
+output:
+  html_document: default
+  pdf_document: 
+          keep_tex: true
+          fig_width: 7
+          fig_height: 6
+          fig_caption: true
+  word_document: default
+header-includes:
+- \usepackage{booktabs}
+- \usepackage{longtable}
+- \usepackage{array}
+- \usepackage{multirow}
+- \usepackage[table]{xcolor}
+- \usepackage{wrapfig}
+- \usepackage{float}
+- \usepackage{colortbl}
+- \usepackage{pdflscape}
+- \usepackage{tabu}
+- \usepackage{threeparttable}
+- \usepackage{threeparttablex}
+- \usepackage[normalem]{ulem}
+- \usepackage{makecell}
+keywords: [Multilevel analysis, other]
+csl: ama-raw.csl
+bibliography: bibfile.bib
+---
+
+
+\tableofcontents
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+options(citation_format = "pandoc", cite.style = "authoryear")
+
+MORexampledir <- 
+        "~/Documents/Active Projects/DIVERSE/Methods/MOR Example Manuscript"
+
+library(dplyr)
+library(ggplot2)
+library(tableone)
+library(splines)
+library(pander)
+
+panderOptions('table.style', 'rmarkdown') 
+panderOptions('big.mark', ',')
+
+RUN_lme4 <- FALSE
+PLOTS <- FALSE
+
+```
+
+
+# Data Analysis
+
+## R packages
+
+Below is a list of R packages used. All analyses done in R v 3.5 [@Rcore]
+
+* dplyr [@dplyr] 
+* tidyr [@tidyr] 
+* readr [@readr] 
+* merTools [@merTools] 
+* ggplot2 [@ggplot2] 
+* datatable [@datatable] 
+* knitr [@knitr1] [@knitr2] [@knitr3] 
+* tidytext [@tidytext] 
+* kableExtra [@Zhu2018]
+
+## Data Acquisition
+
+Data is acquired from eICU Collaborative Research Database [@Goldberger2000] as a series of compressed .csv.gz files. Data is available to any researcher who completes the online ethics course and submits a brief application, as outlined here: `https://physionet.org/physiobank/database/eicucrdb/`. 
+
+## Reading in Data
+
+We use *readr* [@readr] to read in the data from the patient table (*patient.csv.gz*), the APACHE table (*apachePatientResult*) and the Care Plan table (*carePlanGeneral.csv.gz*).
+
+```{r}
+## Load required libraries
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(data.table)
+library(readr)
+library(tidytext)
+library(data.table)
+
+
+## Read in required tables
+
+eICUdir <- "/Users/cyarnell/Documents/Reference Files/D/Databases/eICU"
+
+
+PatientTable <- read_csv(paste(eICUdir, "/patient.csv.gz", sep=""), 
+                         col_names = TRUE, na = c("", "NA"), quoted_na = TRUE,
+  quote = "\"", comment = "")
+
+ApacheTable <- read_csv(paste(eICUdir, "/apachePatientResult.csv.gz", sep=""), 
+                         col_names = TRUE, na = c("", "NA"), quoted_na = TRUE,
+  quote = "\"", comment = "")
+
+CarePlanTable <- read_csv(paste(eICUdir, "/carePlanGeneral.csv.gz", sep=""), 
+                         col_names = TRUE, na = c("", "NA"), quoted_na = TRUE,
+                         quote = "\"", comment = "")
+
+```
+
+## Processing Data
+
+The data is now in three tables which are linked by the ID "patientunitstayid". This ID corresponds to a single episode of ICU care and so the same patient may have multiple episodes within the same hospital stay and some patients may have multiple hospital stays. In this example we consider only initial admissions to ICU. 
+
+Now we extract care plans involving care limitation. From a clinical perspective, the most relevant care limitation is the most recent one and so we extract the last care plan involving care limitation for each ICU admission. 
+
+
+```{r}
+# Make table with last Care Limitation event for each ICU admission 
+
+CarePlanTable_LastLimit <- group_by(CarePlanTable, patientunitstayid) %>% 
+        dplyr::filter(cplgroup == "Care Limitation") %>% 
+        slice(which.max(cplitemoffset))
+```
+
+Next we merge tables and identify the first ICU admission for each patient. We keep the rows corresponding to the first ICU admission in the earliest hospital admission year for each patient. 
+If there are two admissions in the same year then there is no way to tell which is first so we just take the first one that we find. 
+
+```{r}
+
+# Left join to match Care Limitation data to first ICU admissions
+
+DT <- left_join(PatientTable, CarePlanTable_LastLimit, by = "patientunitstayid") %>%
+        ungroup(ungroup())
+
+# Left join to match Apache Score and predicted mortality 
+tmp <- dplyr::select(dplyr::filter(ApacheTable, 
+                     apacheversion == "IV"), patientunitstayid, 
+                     apachescore, predictedicumortality, 
+                     actualicumortality, 
+                     predictedhospitalmortality, 
+                     actualhospitalmortality)
+
+DT <- left_join(DT, tmp, by = "patientunitstayid")
+
+# Keep only first ICU admission
+
+DT <- DT %>%
+        group_by(uniquepid) %>%
+        slice(which.min(hospitaldischargeyear)) %>%
+        slice(which.max(hospitaladmitoffset)) %>%
+        ungroup(ungroup())
+
+# Tidying up the age variables - some ages are "> 89". 
+# Set the age "> 89" to 90.
+
+x <- which(DT$age == "> 89")
+DT$age[x] <- "90"
+DT$age <- as.numeric(DT$age)
+
+
+# Make dataframe Z that includes all the patients and hospitals we eventually exclude
+
+Z <- left_join(PatientTable, tmp, by = "patientunitstayid") %>%
+        group_by(uniquepid) %>%
+        slice(which.min(hospitaldischargeyear)) %>%
+        slice(which.max(hospitaladmitoffset)) %>%
+        ungroup(ungroup())
+        
+Z <- Z %>%
+        group_by(hospitalid) %>%
+        mutate(ethnicDiversity = mean(ethnicity != "Caucasian", 
+                                      na.rm = TRUE)) %>%
+        ungroup() %>%
+        add_count(hospitalid) %>%
+        mutate(ethnicity = (ethnicity != "Caucasian"))
+
+x <- which(Z$age == "> 89")
+Z$age[x] <- "90"
+Z$age <- as.numeric(Z$age)
+
+
+# Rename the confusing "cplitemvalue" to "GoalsOfCare"
+names(DT)[34] <- "GoalsOfCare"
+
+DT$ethnicity <- DT$ethnicity != "Caucasian"
+DT$actualicumortality <- as.factor(DT$actualicumortality)
+DT$actualhospitalmortality <- as.factor(DT$actualhospitalmortality)
+
+# make gender a factor
+DT$gender <- as.factor(DT$gender)
+
+# remove small number of unknown and other gender
+DT <- dplyr::filter(DT, gender == "Male" | gender == "Female")
+DT$gender <- as.factor(as.character(DT$gender))
+
+
+# Turn ethnicity into a binary 1 = non-caucasian 0 = caucasian variable
+DT$ethnicity <- DT$ethnicity != "Caucasian"
+
+## Distribution of hospital sizes
+a <- summarise(group_by(Z, hospitalid), n())
+summary(a)
+
+sum(a<10)/dim(a)[1]
+sum(a<20)/dim(a)[1]
+sum(a<30)/dim(a)[1]
+sum(a<40)/dim(a)[1]
+
+quantile(unlist(a),c(0,0.03, 0.05, 0.1))
+
+# drop clusters with less than 40 patients (~ bottom 5%)
+
+DT <- add_count(DT, hospitalid) %>%
+        dplyr::filter(n > 40)
+
+DT_withNA <- DT # just in case
+
+```
+
+```{r}
+# Make goals of care into a binary variable 
+# (1 = care limitation, 0 = full code)
+DT <- dplyr::filter(DT, !is.na(GoalsOfCare))
+DT$GoalsOfCare <- DT$GoalsOfCare != "Full therapy" 
+
+DT_withNA$GoalsOfCare <- DT_withNA$GoalsOfCare != "Full therapy"
+# now 1 indicates limitation and 0 indicates "Full therapy"
+```
+
+```{r}
+# Load libraries we will need below
+
+library(lme4)
+library(splines)
+
+## remove rows with NA values in variables used in the analysis
+
+DT_lme <- na.omit(dplyr::select(DT, age, apachescore, GoalsOfCare,
+                                           gender, ethnicity, 
+                                hospitalid, uniquepid))
+
+DT_final <- left_join(DT_lme, dplyr::select(DT,-age, -apachescore, 
+                                            -GoalsOfCare, -gender, 
+                                            -ethnicity, -hospitalid), 
+                      by = "uniquepid")
+
+DT_final <- add_count(DT_final, hospitalid)
+
+# make carelimits variable which is logical based on presence 
+# or absence of goals of care information
+Z$carelimits <- Z$patientunitstayid %in% DT_lme$patientunitstayid
+
+
+# find age quantiles to set knot locations for splines
+knots <- quantile(DT_lme$age, c(0.05,0.35,0.65,0.95), na.rm = TRUE)
+
+```
+
+```{r}
+## Make ethnic diversity variable 
+
+DT <- DT %>%
+        group_by(hospitalid) %>%
+        mutate(ethnicDiversity = mean(ethnicity, na.rm = TRUE)) %>%
+        ungroup()
+
+median_eD <- median(DT$ethnicDiversity)
+
+DT_final <- DT_final %>%
+        group_by(hospitalid) %>%
+        mutate(ethnicDiversity = mean(ethnicity, na.rm = TRUE)) %>%
+        ungroup()
+
+```
+
+## Table 1 Code
+
+Using `kableExtra` and `kable` from the `knitr` package.
+
+``` {r eval = FALSE, message = FALSE, warning = FALSE}
+
+## Table 1 code
+
+Tbl1 <- data.frame(matrix(nrow = 18, ncol = 1))
+
+row.names(Tbl1) <- c("Included",
+                     "Missing information",
+                     "Female",
+                     "Male",
+                     "Unknown / Missing",
+                     "Age (years)",
+                     "Caucasian",
+                     "Non-Caucasian",
+                     "Missing",
+                     "Score",
+                     "Missing ",
+                     "Patients per hospital",
+                     "Included hospitals",
+                     "Proportion non-Caucasian (percent)",
+                     "Death before ICU discharge",
+                     "Missing  ",
+                     "Present",
+                     "Missing     ")
+
+NumPercent <- function(A,B){paste0(
+        prettyNum(A, big.mark = ","), " (", round(100*A/B), "%)")}
+MedIQR <- function(A){a <- prettyNum(summary(A),big.mark = ",")
+        paste0(a[3], " [", a[2], "-", a[5], "]")}
+
+Tbl1[1,1] <- NumPercent(dim(DT_lme)[1],dim(Z)[1])
+Tbl1[2,1] <- NumPercent(dim(Z)[1] - dim(DT_lme)[1],dim(Z)[1])
+
+Tbl1[3,1] <- NumPercent(sum(Z$gender == "Female", 
+                            na.rm = TRUE), length(Z$gender))
+Tbl1[4,1] <- NumPercent(sum(Z$gender == "Male", 
+                            na.rm = TRUE), length(Z$gender))
+Tbl1[5,1] <- NumPercent(sum(Z$gender != "Female" & 
+                Z$gender != "Male", 
+                na.rm = TRUE), length(Z$gender))
+
+Tbl1[6,1] <- MedIQR(Z$age)
+
+Tbl1[7,1] <- NumPercent(sum(Z$ethnicity == FALSE,
+                             na.rm = TRUE), length(Z$ethnicity))
+Tbl1[8,1] <- NumPercent(sum(Z$ethnicity == TRUE, 
+                            na.rm = TRUE), length(Z$ethnicity))
+Tbl1[9,1] <- NumPercent(sum(is.na(Z$ethnicity)), length(Z$ethnicity))
+
+Tbl1[10,1] <- MedIQR(Z$apachescore)
+Tbl1[11,1] <- NumPercent(sum(is.na(Z$apachescore)), 
+                         length(Z$apachescore))
+
+Tbl1[12,1] <- MedIQR(DT_final$n)
+Tbl1[13,1] <- NumPercent(length(unique(DT_final$hospitalid)),
+                         length(unique(Z$hospitalid)))
+Tbl1[14,1] <- MedIQR(round(Z$ethnicDiversity*100))
+
+Tbl1[15,1] <- NumPercent(sum(Z$unitdischargestatus == "Expired", 
+                             na.rm = TRUE), length(Z$unitdischargestatus))
+Tbl1[16,1] <- NumPercent(sum(is.na(Z$unitdischargestatus)), 
+                         length(Z$unitdischargestatus))
+
+Tbl1[17,1] <- NumPercent(sum(Z$carelimits), length(Z$carelimits))
+Tbl1[18,1] <- NumPercent(length(Z$carelimits) - 
+                                 sum(Z$carelimits), length(Z$carelimits))
+
+colnames(Tbl1) <- "Summary"
+```
+
+
+```{r eval = FALSE}
+library(knitr)
+library(kableExtra)
+
+knitr::kable(Tbl1, row.names = TRUE, "latex", booktabs = TRUE, 
+             caption = "Baseline Patient Information") %>%
+        kable_styling(position = "center") %>%
+        group_rows("Total Patients", 1,2) %>%
+        group_rows("Gender", 3,5) %>%
+        group_rows("Ethnicity", 7,9) %>%
+        group_rows("APACHE IV", 10,11) %>%
+        group_rows("Hospital characteristics", 12,14) %>%
+        group_rows("ICU mortality",15,16) %>%
+        group_rows("Goals of care information",17,18) %>%
+        footnote(symbol = "Each row summarized as mean (%) or median [IQR].")
+```
+
+## Models
+
+We use R package `lme4` for random effects models. [@lme4]
+
+### Model 1: Fixed-effects for Ethnicity
+
+The first model assumes that ethnicity has a fixed effect on likelihood of care limitations. There are no random effects.
+
+```{r eval = RUN_lme4}
+## Using Bates' lme4
+
+Model1_lme4 <- glm(GoalsOfCare ~ ns(age, knots = knots) + gender + 
+                     apachescore + ethnicity, 
+                     data = DT_lme,
+                     family = binomial)
+a <- summary(Model1_lme4)
+a
+```
+
+### Model 2: Fixed-effects for Ethnicity and Hospital-Level Random Intercepts
+
+The second model adds a random intercept $u_j$ for each hospital and ethnicity has a fixed effect $\beta_1$. The model is now:
+
+\begin{eqnarray}
+y_{ij} &\sim& \text{Binomial}(1, \pi_{ij}) \\
+\text{logit}(\pi_{ij}) &=& \beta_0 + \beta_1x_1 + u_j.
+\end{eqnarray}
+
+```{r eval = RUN_lme4}
+
+## Using Bates' lme4
+library(optimx)
+Model2_lme4 <- glmer(GoalsOfCare ~ ns(age, knots = knots) + gender + 
+                     apachescore + ethnicity + (1 | hospitalid), 
+                     data = DT_lme,
+                     family = binomial, 
+                     control = glmerControl(optimizer = "bobyqa"))
+
+a <- summary(Model2_lme4)
+a
+
+```
+
+
+### Model 3: Fixed and Random Effects for Ethnicity and Hospital-Level Random Intercepts
+
+The third model adds a random slope $\phi_j$ for variable $x_1$ to the second model:
+
+\begin{eqnarray}
+y_{ij} &\sim& \text{Binomial}(1, \pi_{ij}) \\
+\text{logit}(\pi_{ij}) &=& \beta_0 + (\beta_1 + \phi_j)x_1 + u_j.
+\end{eqnarray}
+
+```{r eval = RUN_lme4}
+
+## Using Bates' lme4
+
+Model3_lme4 <- glmer(GoalsOfCare ~ ns(age, knots = knots) + gender + 
+                     apachescore + ethnicity + (1 + ethnicity | hospitalid), 
+                     data = na.omit(dplyr::select(DT, 
+                        age, apachescore, GoalsOfCare,
+                        gender, ethnicity, hospitalid)),
+                     family = binomial, 
+                     control = glmerControl(optimizer = "bobyqa"))
+
+a <- summary(Model3_lme4)
+a
+
+```
+
+
+
+### Model 4: Random Slope for Ethnicity, Hospital-level Ethnicity Fixed Effect and Hospital-Level Random Intercepts
+
+For the final model we create a cluster-level variable ("ethnic diversity") which classifies all hospitals by proportion of their patients who have non-Caucasian ethnicity. All hospitals with a higher proportion than the median will be coded as having "higher" ethnic diversity and all others will be coded as having "lower" ethnic diversity. Building on Model 3 using cluster-level variable $x_2$, the model is now written:
+
+\begin{eqnarray}
+y_{ij} &\sim& \text{Binomial}(1, \pi_{ij}) \\
+\text{logit}(\pi_{ij}) &=& \beta_0 + (\beta_1 + \phi_j)x_1 + \beta_2 x_2 + u_j. \label{model4}
+\end{eqnarray}
+
+
+We will see how much of the hospital-level ethnicity-specific variation is explained by this cluster-level variable. In other words, we will calculate the interval covering 80% of the odds ratios when comparing the odds of having a care limitation for a non-Caucasian patient when that patient is moved from a hospital of higher ethnic diversity to a hospital of lower ethnic diversity.
+
+
+```{r eval = RUN_lme4}
+## with Bates' lme4
+
+# 1 for low ethnic diversity, 0 for high ethnic diversity
+DT$ethnicDiversity <- DT$ethnicDiversity < median_eD 
+
+
+Model4_lme4 <- glmer(GoalsOfCare ~ ns(age, knots = knots) + gender + ethnicDiversity
+                     + apachescore + ethnicity + 
+                             (1 + ethnicity | hospitalid), 
+                     data = na.omit(dplyr::select(DT, age, 
+                                apachescore, GoalsOfCare,
+                            ethnicDiversity, gender, 
+                            ethnicity, hospitalid)),
+                     family = binomial, 
+                     control = glmerControl(optimizer = "bobyqa"))
+
+a <- summary(Model4_lme4)
+a
+
+```
+
+## Table 2 Code
+
+```{r  eval = RUN_lme4}
+## Make Table 2 Dataframe.
+
+## Variance given x1 dichotomous function, takes model as input
+Va <- function(A){
+        a <- summary(A)
+        sigma2 <- a$varcor$hospitalid[1]
+        phi2 <- a$varcor$hospitalid[4]
+        covsp <- a$varcor$hospitalid[3]
+        c(sigma2, sigma2 + phi2 + 2*covsp)}
+
+## Median Odds Ratio function
+MOR <- function(A){round(exp(sqrt(2*A)*qnorm(0.75)),2)}
+
+## Interval Odds Ratio function
+IOR <- function(A,B){round(c(
+        exp(B + sqrt(2*A)*qnorm(0.1)), 
+        exp(B + sqrt(2*A)*qnorm(0.9))),2)}
+
+Tbl2 <- data.frame(matrix(nrow = 9, ncol = 4))
+colnames(Tbl2) <- c("Model 1", "Model 2", "Model 3", "Model 4")
+
+Tbl2 <- Tbl2 %>%
+        mutate("Model 1" = "--") %>%
+        mutate("Model 2" = "--") %>%
+        mutate("Model 3" = "--") %>%
+        mutate("Model 4" = "--")
+
+OR_95 <- function(B, s){
+        a <- round(exp(B),2)
+        b <- round(exp(B + 1.96*s),2)
+        c <- round(exp(B - 1.96*s),2)
+        paste0(a, " (", c, "-", b, ")" )}
+
+OR_95re <- function(A,v){
+        a <- summary(A)
+        OR_95(a$coefficients[v,1], a$coefficients[v,2])}
+
+OR_names <- c("ethnicityTRUE", "apachescore", 
+              "genderMale", "ethnicDiversityTRUE")
+
+Tbl2[1,1] <- OR_95(coef(M1)[OR_names[1]],
+                   summary(M1)$coefficients[OR_names[1],"Std. Error"])
+Tbl2[2,1] <- OR_95(coef(M1)[OR_names[2]],
+                   summary(M1)$coefficients[OR_names[2],"Std. Error"])
+Tbl2[3,1] <- OR_95(coef(M1)[OR_names[3]],
+                   summary(M1)$coefficients[OR_names[3],"Std. Error"])
+
+Tbl2[1,2] <- OR_95re(M2, OR_names[1])
+Tbl2[2,2] <- OR_95re(M2, OR_names[2])
+Tbl2[3,2] <- OR_95re(M2, OR_names[3])
+
+Tbl2[1,3] <- OR_95re(M3, OR_names[1])
+Tbl2[2,3] <- OR_95re(M3, OR_names[2])
+Tbl2[3,3] <- OR_95re(M3, OR_names[3])
+
+Tbl2[1,4] <- OR_95re(M4, OR_names[1])
+Tbl2[2,4] <- OR_95re(M4, OR_names[2])
+Tbl2[3,4] <- OR_95re(M4, OR_names[3])
+Tbl2[4,4] <- OR_95re(M4, OR_names[4])
+
+Tbl2[5,2] <- MOR(summary(M2)$varcor$hospitalid[1])
+Tbl2[6:7,3] <- MOR(Va(M3))
+Tbl2[6:7,4] <- MOR(Va(M4))
+
+AICrow <- function(M1, M2, M3, M4){round(c(AIC(M1), 
+                                           AIC(M2), AIC(M3), AIC(M4)))}
+LLrow <- function(M1, M2, M3, M4){
+        round(c(logLik(M1), logLik(M2), 
+                logLik(M3), logLik(M4)))}
+
+Tbl2[8,] <- AICrow(M1, M2, M3, M4)
+Tbl2[9,] <- LLrow(M1, M2, M3, M4)
+
+rownames(Tbl2) <- c("Non-Caucasian ethnicity", 
+                    "APACHE score",
+                    "Male gender",
+                    "Lower hospital diversity",
+                    "Overall",
+                    "Non-Caucasian ethnicity ",
+                    "Caucasian ethnicity ",
+                    "AIC*",
+                    "Log-likelihood")
+
+```
+
+```{r results = "asis", eval =RUN_lme4}
+
+
+knitr::kable(Tbl2, row.names = TRUE, format = "latex", booktabs = TRUE, 
+             caption = "Summary of Models Predicting Care Limitations") %>%
+        kable_styling(latex_options = c("striped"), position = "center") %>%
+        group_rows("Odds ratio (95% CI)", 1,4) %>%
+        group_rows("Median odds ratio", 5,7) %>%
+        group_rows("Model fit", 8,9) %>%
+        footnote(symbol = "Akaike Information Criterion") %>%
+        landscape()
+        
+```
+
+## Figure 1 Code
+
+Both figures use R package `merTools` for simulation-based prediction and confidence interval calculation. [@merTools] For the second figure the code has been adapted slightly to change the formatting.
+
+```{r eval = RUN_lme4}
+M1 <- Model1_lme4
+M2 <- Model2_lme4
+M3 <- Model3_lme4
+M4 <- Model4_lme4
+```
+
+```{r eval = PLOTS}
+library(merTools)
+library(ggplot2)
+
+# generate data for plotting the age splines, one point for every
+# other year, using APACHE 25th and 75th percentile values 
+# and each gender
+
+newdata2 = DT_lme[seq(30,89,by = 4),]
+newdata2 <- newdata2 %>%
+        mutate(gender = "Male") %>%
+        mutate(apachescore = quantile(DT_lme$apachescore, 0.75)) %>%
+        mutate(hospitalid = DT_final$hospitalid[which.max(DT_final$n)])
+newdata2$age <- seq(30,89,by = 4)
+newdata2$ethnicity <- TRUE
+newdata2$gender <- as.factor(newdata2$gender)
+newdata3 <- mutate(newdata2, ethnicity = FALSE) %>%
+        mutate(age = age+2)
+newdata2 <- rbind(newdata2, newdata3)
+newdata4 <- mutate(newdata2, gender = "Female")
+newdata <- rbind(newdata2, newdata4)
+newdata <- rbind(newdata, mutate(newdata, apachescore = quantile(DT_lme$apachescore, 0.25)))
+
+# use predictInterval function to get upper and lower bounds
+# gives conservative estimates because does not account for correlation between 
+# fixed and random effects
+# so we fix intercept variance as per vignette
+# https://cran.rstudio.com/web/packages/merTools
+# /vignettes/Using_predictInterval.html
+
+X <- predictInterval(M3, newdata,which = "full", 
+                     level = 0.95, n.sims = 1000, 
+                     include.resid.var=0, 
+                     fix.intercept.variance = TRUE, 
+                     type = "probability")
+
+predicted2 <- cbind(X, newdata)
+predicted2 <- mutate(predicted2, ethnicity = as.factor(ethnicity))
+levels(predicted2$ethnicity) = c("Caucasian","Non-caucasian")
+names(predicted2) <- c("fit","upr","lwr","Age","APACHE",
+                       "GoalsOfCare", "Gender","Ethnicity", 
+                       "hospitalid", "uniquepid")
+g <- ggplot(data = predicted2, 
+            aes(y = fit, 
+                ymin = lwr, ymax = upr, 
+                x = Age, color = Ethnicity, 
+                fill = Ethnicity))
+```
+
+
+```{r  eval = PLOTS, fig.cap="\\label{fig:1}This figure shows the predicted probability of having a care limitation on the y axis and patient age on the x axis calculated using Model 3. Ethnicities are separated by colour. Hospital was set to the modal hospital. The central line denotes the estimate and the errorbars surrounding denote the 95% confidence interval including variation due to random effects and not including correlation between fixed and random coefficients"}
+g +     geom_errorbar() + 
+        geom_line(size = 0.7) + 
+        labs(
+                title = "Probability of Having 
+                a Care Limitation by Age", 
+                x = "Age (Years)", 
+                y = "Probability") + 
+        guides(alpha = FALSE) +
+        ylim(c(0,0.4)) + 
+        facet_grid(APACHE ~ Gender, labeller = label_both) + 
+        scale_fill_manual(values=cbPalette) + 
+        scale_colour_manual(values=cbPalette) + 
+        theme_bw() + 
+        theme(panel.grid.minor = element_blank())
+
+```
+
+## Figure 2 Code
+
+```{r eval = PLOTS}
+## slightly altered version of plotREsim function:
+
+plotREsim2 <- function(data, level = 0.95, stat = "median", sd = TRUE,
+                      sigmaScale = NULL, oddsRatio = FALSE, labs = FALSE,
+                      facet= TRUE){
+        
+  # check for faceting
+  facet_logical <- is.logical(facet)
+  if (!facet_logical) {
+    data <- data[data$groupFctr == facet[[1]] & data$term == facet[[2]], ]
+  }
+
+  if(!missing(sigmaScale)){
+    data[, "sd"] <- data[, "sd"] / sigmaScale
+    data[, stat] <- data[, stat] / sigmaScale
+  }
+  data[, "sd"] <- data[, "sd"] * qnorm(1-((1-level)/2))
+  data[, "ymax"] <- data[, stat] + data[, "sd"]
+  data[, "ymin"] <- data[, stat] - data[, "sd"]
+  data[, "sig"] <- data[, "ymin"] > 0 | data[, "ymax"] < 0
+  hlineInt <- 0
+  if(oddsRatio == TRUE){
+    data[, "ymax"] <- exp(data[, "ymax"])
+    data[, stat] <- exp(data[, stat])
+    data[, "ymin"] <- exp(data[, "ymin"])
+    hlineInt <- 1
+  }
+  data <- data[order(data[,"groupFctr"], data[,"term"], data[,stat]),]
+  rownames(data) <- 1:nrow(data)
+  data[,"xvar"] <- factor(paste(data$groupFctr, data$groupID, sep=""),
+                          levels=unique(paste(data$groupFctr,data$groupID, sep="")),
+                          ordered=TRUE)
+  if(labs == TRUE){
+    xlabs.tmp <- element_text(face = "bold", angle=90, vjust=.5)
+  } else {
+    data[,"xvar"] <- as.numeric(data[,"xvar"])
+    xlabs.tmp <- element_blank()
+  }
+
+  p <- ggplot(data, aes_string(x = "xvar", y = stat, ymax = "ymax", ymin = "ymin")) +
+         geom_hline(yintercept = hlineInt, color = I("red"), size = I(1.1)) +
+         geom_point(color="gray75", alpha=2/10, size=I(0.5)) +
+         labs(x = "Group", y = "Effect Range", title = "Effect Ranges") +
+         theme_bw() +
+         theme(panel.grid.minor = element_blank(),
+               axis.text.x = xlabs.tmp,
+               axis.ticks.x = element_blank())
+  if (sd) {
+    p <- p +
+      geom_pointrange(alpha = 2/10)
+  }
+  # check facet
+  if (facet_logical) {
+    return(p + facet_grid(term ~ groupFctr, scales = "free_x"))
+  } else {
+    return(p)
+  }
+}
+```
+
+Generate dataframe of random effects with margins of error from simulation. The margins of error are likely conservative because they do not take correlation between fixed and random coefficents in to account.
+
+```{r eval = PLOTS}
+# Next a plot of Random Effect Ranges using functions from merTools
+reEx <- REsim(M3, n.sims = 2000)
+reEx <- mutate(reEx, term = as.factor(term))
+reEx <- mutate(reEx, groupFctr = as.factor(groupFctr))
+levels(reEx$term) <- c("Random Intercept", "Non-Caucasian Ethnicity")
+levels(reEx$groupFctr) <- "Hospital ID"
+
+```
+
+
+```{r  eval = PLOTS, fig.cap="\\label{fig:2}This figure shows the random intercepts and slopes estimated for each hospital in Model 4. The y axis shows the odds ratio plotted in logarithm scale. Each point has an associated vertical line representing the 95% confidence interval of the estimate for that point. The upper panel shows the distribution of hospital intercepts. The lower panel shows the distribution of random slopes associated with non-Caucasian ethnicity."}
+p1 <-  plotREsim2(reEx, oddsRatio = TRUE)
+p1 + labs(y = "Odds Ratio of Having a Care Limitation (log scale)") 
++ scale_y_continuous(trans='log2') 
++ labs(x = "Hospital ID") 
++ labs(title = "Random Effect Ranges")
+```
+
+# References
